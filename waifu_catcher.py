@@ -22,6 +22,7 @@ import math
 import os
 import random
 import html
+from difflib import SequenceMatcher
 from itertools import groupby
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -31,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 # --- Config knobs -----------------------------------------------------
 SPAWN_EVERY = 100          # spawn a new character every N group messages
+GUESS_SIMILARITY_THRESHOLD = 0.82  # 0-1, lower = more typo-tolerant
 RARITY_MAP = {1: "⚪ Common", 2: "🟣 Rare", 3: "🟡 Legendary", 4: "🟢 Medium", 5: "💮 Special edition"}
 
 # --- Module state (populated by init()) --------------------------------
@@ -167,6 +169,28 @@ async def _spawn(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
 
 # --- Guessing / claiming ---
 
+def _similar(a: str, b: str) -> float:
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def _is_correct_guess(guess: str, character_name: str) -> bool:
+    """Typo-tolerant check: exact/partial match OR close enough (>= GUESS_SIMILARITY_THRESHOLD)."""
+    name_lower = character_name.lower()
+    name_parts = name_lower.split()
+    guess_parts = guess.split()
+
+    # exact full-name or exact single-word match (fast path, no fuzziness needed)
+    if sorted(name_parts) == sorted(guess_parts) or any(part == guess for part in name_parts):
+        return True
+
+    # fuzzy: whole guess vs full name, and vs each individual name part
+    if _similar(guess, name_lower) >= GUESS_SIMILARITY_THRESHOLD:
+        return True
+    if any(_similar(guess, part) >= GUESS_SIMILARITY_THRESHOLD for part in name_parts):
+        return True
+    return False
+
+
 async def guess_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_ready():
         await update.message.reply_text(_not_ready_text())
@@ -191,10 +215,8 @@ async def guess_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     character = _last_characters[chat_id]
-    name_parts = character["name"].lower().split()
 
-    correct = sorted(name_parts) == sorted(guess_text.split()) or any(part == guess_text for part in name_parts)
-    if not correct:
+    if not _is_correct_guess(guess_text, character["name"]):
         await update.message.reply_text("❌ Not quite — try again!")
         return
 
@@ -340,6 +362,40 @@ async def fav_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 # --- Source group intake: post a photo + caption there instead of typing /upload ---
 
+def _parse_character_line(text: str):
+    """Parse 'Name | Anime | Rarity(1-4)' (also accepts '/' or newline as separator).
+    Returns (name, anime, rarity_label) or None if the text doesn't match.
+    """
+    text = (text or "").strip()
+    parts = None
+    for sep in ("|", "\n", "/"):
+        if sep in text:
+            parts = [p.strip() for p in text.split(sep) if p.strip()]
+            break
+    if not parts or len(parts) < 3:
+        return None
+    raw_name, raw_anime, raw_rarity = parts[0], parts[1], parts[2]
+    try:
+        rarity = RARITY_MAP[int(raw_rarity)]
+    except (KeyError, ValueError):
+        return None
+    return raw_name.title(), raw_anime.title(), rarity
+
+
+_FORMAT_HELP = (
+    "⚠️ Format galat/missing hai. Ye format use karo:\n"
+    "`Character Name | Anime Name | Rarity(1-4)`\n"
+    "e.g. `Muzan Kibutsuji | Demon Slayer | 3`"
+)
+
+
+async def _insert_character(file_id: str, name: str, anime: str, rarity: str) -> str:
+    char_id = str(await _next_sequence("character_id")).zfill(2)
+    character = {"id": char_id, "img_url": file_id, "name": name, "anime": anime, "rarity": rarity}
+    await collection.insert_one(character)
+    return f"✅ Added — ID {char_id}: {name} ({anime}, {rarity})"
+
+
 async def handle_source_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Register this on filters.PHOTO (any chat). It only acts on messages that
     land in the configured WAIFU_SOURCE_CHAT_ID, so it's safe to leave attached
@@ -358,39 +414,50 @@ async def handle_source_photo(update: Update, context: ContextTypes.DEFAULT_TYPE
         await message.reply_text("🚫 Only sudo users can add characters from this group.")
         return
 
-    caption = (message.caption or "").strip()
-    parts = None
-    for sep in ("|", "\n", "/"):
-        if sep in caption:
-            parts = [p.strip() for p in caption.split(sep) if p.strip()]
-            break
-    if not parts or len(parts) < 3:
-        await message.reply_text(
-            "⚠️ Caption format galat/missing hai. Photo ke saath ye caption bhejo:\n"
-            "`Character Name | Anime Name | Rarity(1-4)`\n"
-            "e.g. `Muzan Kibutsuji | Demon Slayer | 3`",
-            parse_mode="Markdown",
-        )
+    # If there's no caption at all, this photo was probably dumped without one —
+    # someone will reply to it later with the name/anime/rarity line instead.
+    if not (message.caption or "").strip():
         return
 
-    raw_name, raw_anime, raw_rarity = parts[0], parts[1], parts[2]
-    try:
-        rarity = RARITY_MAP[int(raw_rarity)]
-    except (KeyError, ValueError):
-        await message.reply_text("⚠️ Rarity 1, 2, 3, ya 4 hona chahiye.")
+    parsed = _parse_character_line(message.caption)
+    if not parsed:
+        await message.reply_text(_FORMAT_HELP, parse_mode="Markdown")
         return
 
+    name, anime, rarity = parsed
     file_id = message.photo[-1].file_id  # highest-resolution version Telegram kept
-    char_id = str(await _next_sequence("character_id")).zfill(2)
-    character = {
-        "id": char_id,
-        "img_url": file_id,   # a Telegram file_id works exactly like a URL for send_photo
-        "name": raw_name.title(),
-        "anime": raw_anime.title(),
-        "rarity": rarity,
-    }
-    await collection.insert_one(character)
-    await message.reply_text(f"✅ Added — ID {char_id}: {character['name']} ({character['anime']}, {rarity})")
+    reply = await _insert_character(file_id, name, anime, rarity)
+    await message.reply_text(reply)
+
+
+async def handle_source_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Register this on filters.TEXT (any chat). Lets you reply to an
+    already-posted photo (e.g. one dumped without a caption) with a plain
+    text line like `Kaori Miyazono | Shigatsu wa Kimi no Uso | 3` to add it
+    — no need to re-post the photo with a caption.
+    """
+    if not is_ready() or not SOURCE_CHAT_ID:
+        return
+    message = update.effective_message
+    if not message or update.effective_chat.id != SOURCE_CHAT_ID:
+        return
+    replied = message.reply_to_message
+    if not replied or not replied.photo or not message.text:
+        return
+
+    user = update.effective_user
+    if not is_sudo(user.id):
+        return  # stay quiet for non-sudo replies in the group, avoid noise
+
+    parsed = _parse_character_line(message.text)
+    if not parsed:
+        await message.reply_text(_FORMAT_HELP, parse_mode="Markdown")
+        return
+
+    name, anime, rarity = parsed
+    file_id = replied.photo[-1].file_id
+    reply = await _insert_character(file_id, name, anime, rarity)
+    await message.reply_text(reply)
 
 
 # --- Admin: upload / delete / edit ---
