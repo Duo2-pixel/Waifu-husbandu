@@ -1,0 +1,4 @@
+python-telegram-bot>=22.3
+motor
+pymongo
+python-dotenv
