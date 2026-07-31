@@ -104,8 +104,15 @@ def main() -> None:
     application.add_handler(CommandHandler("wedit", waifu_catcher.update_command))
     application.add_handler(CommandHandler("wstats", waifu_catcher.wstats_command))
 
-    # --- Source group photo intake ---
+    # --- Source group photo intake (caption on the photo itself...) ---
     application.add_handler(MessageHandler(filters.PHOTO, waifu_catcher.handle_source_photo))
+    # --- ...or reply to an already-posted photo with the Name | Anime | Rarity line ---
+    # (own handler group so a normal reply in any other group doesn't block the
+    # auto-spawn message counter below, which also matches text messages)
+    application.add_handler(MessageHandler(
+        filters.TEXT & filters.REPLY & (~filters.COMMAND),
+        waifu_catcher.handle_source_reply,
+    ), group=1)
 
     # --- Message counter that drives auto-spawn (group chats only, must stay last) ---
     application.add_handler(MessageHandler(
