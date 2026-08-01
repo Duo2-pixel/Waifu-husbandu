@@ -68,7 +68,8 @@ async def help_command(update: Update, context) -> None:
         "/upload <img_url> <name> <anime> <rarity 1-4> — add a character\n"
         "/delete <id> — remove a character\n"
         "/wedit <id> <field> <value> — edit img_url/name/anime/rarity\n"
-        "/wstats — DB stats\n\n"
+        "/wstats — DB stats\n"
+        "/archiveall — one-time: migrate all existing characters' photos into the archive channel\n\n"
         "Or post a photo captioned <code>Name | Anime | Rarity</code> into the "
         "group set as WAIFU_SOURCE_CHAT_ID to add a character without typing /upload.",
         parse_mode="HTML",
@@ -103,6 +104,7 @@ def main() -> None:
     application.add_handler(CommandHandler("delete", waifu_catcher.delete_command))
     application.add_handler(CommandHandler("wedit", waifu_catcher.update_command))
     application.add_handler(CommandHandler("wstats", waifu_catcher.wstats_command))
+    application.add_handler(CommandHandler("archiveall", waifu_catcher.archiveall_command))
 
     # --- Source group photo intake (caption on the photo itself...) ---
     application.add_handler(MessageHandler(filters.PHOTO, waifu_catcher.handle_source_photo))
