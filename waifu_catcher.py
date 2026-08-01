@@ -17,6 +17,7 @@ group every ~100 messages (tweak SPAWN_EVERY below), and the first person to
 Call `waifu_catcher.init(mongo_client, owner_id=..., sudo_ids=[...])` once at
 startup, before any of these handlers are used.
 """
+import asyncio
 import logging
 import math
 import os
@@ -48,6 +49,7 @@ _last_characters = {}     # chat_id -> character dict currently spawned
 _first_correct = {}       # chat_id -> user_id who already claimed the active spawn
 
 SOURCE_CHAT_ID = None      # the group/channel people post character photos into
+ARCHIVE_CHAT_ID = None      # permanent channel every character photo gets copied into
 OWNER_ID = None
 SUDO_IDS = set()
 
@@ -70,7 +72,7 @@ def init(mongo_client, owner_id: int = None, sudo_ids=None) -> None:
     """
     global db, collection, user_collection, group_user_totals_collection
     global top_global_groups_collection, sequences_collection, SOURCE_CHAT_ID
-    global OWNER_ID, SUDO_IDS
+    global ARCHIVE_CHAT_ID, OWNER_ID, SUDO_IDS
 
     OWNER_ID = owner_id
     SUDO_IDS = set(sudo_ids or [])
@@ -82,6 +84,14 @@ def init(mongo_client, owner_id: int = None, sudo_ids=None) -> None:
             logger.info(f"📸 Waifu source group configured: {SOURCE_CHAT_ID}")
         except ValueError:
             logger.warning(f"WAIFU_SOURCE_CHAT_ID is not a valid integer: {raw_source!r}")
+
+    raw_archive = os.getenv("WAIFU_ARCHIVE_CHANNEL_ID")
+    if raw_archive:
+        try:
+            ARCHIVE_CHAT_ID = int(raw_archive)
+            logger.info(f"🗄️ Waifu archive channel configured: {ARCHIVE_CHAT_ID}")
+        except ValueError:
+            logger.warning(f"WAIFU_ARCHIVE_CHANNEL_ID is not a valid integer: {raw_archive!r}")
 
     if mongo_client is None:
         logger.info("ℹ️ No Mongo client available — waifu catcher game is disabled.")
@@ -389,9 +399,27 @@ _FORMAT_HELP = (
 )
 
 
-async def _insert_character(file_id: str, name: str, anime: str, rarity: str) -> str:
+async def _archive_photo(context: ContextTypes.DEFAULT_TYPE, file_id_or_url: str, caption: str) -> str:
+    """If an archive channel is configured, re-send the photo there and store
+    THAT copy's file_id instead of the original — so the character survives
+    even if the original photo/message gets deleted anywhere else.
+    Falls back to the original file_id/url if no archive channel is set, or
+    if the archive send fails for some reason (e.g. bot not admin there).
+    """
+    if not ARCHIVE_CHAT_ID:
+        return file_id_or_url
+    try:
+        msg = await context.bot.send_photo(chat_id=ARCHIVE_CHAT_ID, photo=file_id_or_url, caption=caption)
+        return msg.photo[-1].file_id
+    except Exception as e:
+        logger.warning(f"⚠️ Could not archive photo, keeping original: {e}")
+        return file_id_or_url
+
+
+async def _insert_character(context: ContextTypes.DEFAULT_TYPE, file_id: str, name: str, anime: str, rarity: str) -> str:
+    stored_file_id = await _archive_photo(context, file_id, f"{name} | {anime} | {rarity}")
     char_id = str(await _next_sequence("character_id")).zfill(2)
-    character = {"id": char_id, "img_url": file_id, "name": name, "anime": anime, "rarity": rarity}
+    character = {"id": char_id, "img_url": stored_file_id, "name": name, "anime": anime, "rarity": rarity}
     await collection.insert_one(character)
     return f"✅ Added — ID {char_id}: {name} ({anime}, {rarity})"
 
@@ -426,7 +454,7 @@ async def handle_source_photo(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     name, anime, rarity = parsed
     file_id = message.photo[-1].file_id  # highest-resolution version Telegram kept
-    reply = await _insert_character(file_id, name, anime, rarity)
+    reply = await _insert_character(context, file_id, name, anime, rarity)
     await message.reply_text(reply)
 
 
@@ -456,7 +484,7 @@ async def handle_source_reply(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     name, anime, rarity = parsed
     file_id = replied.photo[-1].file_id
-    reply = await _insert_character(file_id, name, anime, rarity)
+    reply = await _insert_character(context, file_id, name, anime, rarity)
     await message.reply_text(reply)
 
 
@@ -488,10 +516,8 @@ async def upload_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("Invalid rarity. Use 1, 2, 3, or 4.")
         return
 
-    char_id = str(await _next_sequence("character_id")).zfill(2)
-    character = {"id": char_id, "img_url": img_url, "name": character_name, "anime": anime, "rarity": rarity}
-    await collection.insert_one(character)
-    await update.message.reply_text(f"✅ Character added — ID {char_id}: {character_name} ({anime}, {rarity})")
+    reply = await _insert_character(context, img_url, character_name, anime, rarity)
+    await update.message.reply_text(reply)
 
 
 async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -630,3 +656,50 @@ async def wstats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text(
         f"📊 Waifu catcher stats\nCharacters: {char_count}\nPlayers: {user_count}\nActive groups: {len(group_ids)}"
     )
+
+
+async def archiveall_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Sudo-only, one-time migration: re-sends every existing character's photo
+    into WAIFU_ARCHIVE_CHANNEL_ID and updates the DB to point at that permanent
+    copy. Safe to run more than once — already-archived characters just get
+    re-archived (harmless, just wastes a little time).
+    """
+    if not is_sudo(update.effective_user.id):
+        await update.message.reply_text("🚫 Sudo users only.")
+        return
+    if not is_ready():
+        await update.message.reply_text(_not_ready_text())
+        return
+    if not ARCHIVE_CHAT_ID:
+        await update.message.reply_text(
+            "⚠️ WAIFU_ARCHIVE_CHANNEL_ID isn't set. Add the archive channel's ID "
+            "to your .env, make sure the bot is an admin there, and restart the bot first."
+        )
+        return
+
+    characters = await collection.find({}).to_list(length=None)
+    total = len(characters)
+    if total == 0:
+        await update.message.reply_text("No characters in the database yet.")
+        return
+
+    status_msg = await update.message.reply_text(f"⏳ Archiving {total} characters... this'll take a bit (rate-limited).")
+    migrated, failed = 0, 0
+    for i, c in enumerate(characters, start=1):
+        try:
+            caption = f"{c['name']} | {c['anime']} | {c['rarity']}"
+            new_file_id = await _archive_photo(context, c["img_url"], caption)
+            if new_file_id != c["img_url"]:
+                await collection.update_one({"_id": c["_id"]}, {"$set": {"img_url": new_file_id}})
+                migrated += 1
+        except Exception as e:
+            failed += 1
+            logger.warning(f"Archive failed for character {c.get('id')}: {e}")
+        await asyncio.sleep(1.2)  # stay well under Telegram's per-chat rate limit
+        if i % 20 == 0:
+            try:
+                await status_msg.edit_text(f"⏳ Archiving... {i}/{total} done ({migrated} migrated, {failed} failed)")
+            except Exception:
+                pass
+
+    await status_msg.edit_text(f"✅ Migration done — {migrated} archived, {failed} failed, {total} total.")
